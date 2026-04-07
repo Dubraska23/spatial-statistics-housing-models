@@ -1,0 +1,483 @@
+---
+title: "Introducción a la Estadística Espacial"
+author: "Dubraska Veroes"
+date: '2024'
+output:
+  html_document:
+    df_print: paged
+documentclass: book
+bibliography: 0_biblio.bib
+biblio-style: apalike
+link-citations: true
+site: bookdown::bookdown_site
+---
+
+# Introducción
+
+Este documento presenta el análisis de precios de vivienda mediante técnicas de estadística espacial.
+
+
+
+```{r}
+getwd()
+#knitr::opts_knit$set(root.dir = "C:/Users/karli/Downloads/U0_Estadistica_Espacial/U0_Estadistica_Espacial")
+```
+
+
+
+```{r}
+source("0_Data/FuncionesyLibrerias.R")
+
+```
+
+
+# Estadística Espacial
+
+**<span style="color: orange;"> Cread vuestro propio Book </span>**
+
+
+```{r}
+
+pisos<-read.csv("./0_Data/bbdd_12.csv",sep=",")
+pisos <- pisos[sample(nrow(pisos), 7000, replace = FALSE, prob = NULL),]
+nrow(pisos)
+
+# Convertir a sf
+pisos_sf <- st_as_sf(pisos, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+
+# Asignar rownames
+rownames(pisos_sf) <- pisos_sf$X
+
+colnames(pisos)
+head(pisos)
+dim(pisos)
+names(pisos)
+```
+```{r}
+glimpse(pisos)
+summary(pisos)
+head(pisos)
+
+# Revisar NA
+colSums(is.na(pisos))
+
+# Revisar coordenadas
+summary(pisos$UNITPRICE)
+summary(pisos$CONSTRUCTEDAREA)
+summary(pisos$ROOMNUMBER)
+summary(pisos$BATHNUMBER)
+summary(pisos$LONGITUDE)
+summary(pisos$LATITUDE)
+
+```
+```{r}
+pisos <- pisos |>
+  dplyr::filter(
+    UNITPRICE > 500,
+    UNITPRICE < 20000,
+    CONSTRUCTEDAREA < 500,
+    LONGITUDE > -4,
+    LONGITUDE < -3,
+    LATITUDE > 40.3,
+    LATITUDE < 40.6
+  )
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(sf)
+
+metros <- readRDS("0_Data/metros_osm.rds")
+
+```
+
+
+```{r}
+nrow(metros)
+coordenadas_metro <- metros %>%
+  mutate(
+    lon = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  select(name, lon, lat)
+head(coordenadas_metro)
+```
+
+```{r}
+library(geosphere)
+
+Matriz_Distancias_metro <- distm(
+  cbind(pisos$LONGITUDE, pisos$LATITUDE),
+  cbind(coordenadas_metro$lon, coordenadas_metro$lat),
+  fun = distCosine
+) / 1000   # km
+```
+
+
+```{r}
+pisos$dist_min_metro <- apply(Matriz_Distancias_metro, 1, min)
+```
+```{r}
+W_metro <- (Matriz_Distancias_metro < 0.7) * 1
+pisos$buffer_metro <- apply(W_metro, 1, sum)
+summary(pisos$dist_min_metro)
+summary(pisos$buffer_metro)
+```
+
+```{r}
+library(geosphere)
+
+# Matriz de distancias entre todos los pisos (en km)
+Matriz_Distancias_pisos <- distm(
+  cbind(pisos$LONGITUDE, pisos$LATITUDE),
+  cbind(pisos$LONGITUDE, pisos$LATITUDE),
+  fun = distCosine
+) / 1000
+
+# Buffer de 300 metros
+W_pisos <- (Matriz_Distancias_pisos < 0.3) * 1
+diag(W_pisos) <- 0   # No contarse a sí mismo
+
+pisos$densidad_pisos <- apply(W_pisos, 1, sum)
+summary(pisos$densidad_pisos)
+```
+
+
+```{r}
+library(geosphere)
+
+sol_lon <- -3.703790
+sol_lat <- 40.416775
+
+pisos$dist_centro <- distCosine(
+  cbind(pisos$LONGITUDE, pisos$LATITUDE),
+  c(sol_lon, sol_lat)
+) / 1000   # km
+summary(pisos$dist_centro)
+```
+
+
+
+```{r}
+library(spdep)
+
+coords <- cbind(pisos$LONGITUDE, pisos$LATITUDE)
+
+# Vecinos kNN
+nb <- knn2nb(knearneigh(coords, k = 10))
+
+# Pesos espaciales estandarizados (row-standardized)
+lw_knn <- nb2listw(nb, style = "W")
+
+# Lags espaciales (promedios locales)
+pisos$lag_construction <- lag.listw(lw_knn, pisos$CADCONSTRUCTIONYEAR)
+pisos$lag_unitprice    <- lag.listw(lw_knn, pisos$UNITPRICE)
+pisos$lag_price        <- lag.listw(lw_knn, pisos$PRICE)
+pisos$lag_area         <- lag.listw(lw_knn, pisos$CONSTRUCTEDAREA)
+pisos$lag_bath         <- lag.listw(lw_knn, pisos$BATHNUMBER)
+pisos$lag_rooms        <- lag.listw(lw_knn, pisos$ROOMNUMBER)
+
+```
+### Partición Train/Test (Test = 4000)
+```{r}
+set.seed(12345)
+
+id_test <- sample(1:nrow(pisos), 4000)
+
+Test  <- pisos[id_test, ]
+Train <- pisos[-id_test, ]
+nrow(Train)
+nrow(Test)
+```
+
+```{r}
+library(sf)
+
+Train_sf <- st_as_sf(
+  Train,
+  coords = c("LONGITUDE", "LATITUDE"),
+  crs = 4326
+)
+```
+
+```{r}
+library(spdep)
+
+coords_train <- st_coordinates(Train_sf)
+
+nb_train <- knn2nb(knearneigh(coords_train, k = 10))
+lw_train <- nb2listw(nb_train, style = "W")
+```
+### Moran global el precio
+```{r}
+moran_test <- moran.test(Train$UNITPRICE, lw_train)
+moran_test
+
+```
+
+
+###Moran Local (Lisa)
+```{r}
+lisa <- localmoran(Train$UNITPRICE, lw_train)
+head(lisa)
+```
+ 
+###Mapa Lisa
+```{r}
+Train$lisa_I <- lisa[, 1]
+Train$lisa_p <- lisa[, 5]
+
+Train$lisa_cluster <- "No significativo"
+
+Train$lisa_cluster[
+  Train$lisa_I > 0 & Train$lisa_p <= 0.05
+] <- "High-High"
+
+Train$lisa_cluster[
+  Train$lisa_I < 0 & Train$lisa_p <= 0.05
+] <- "Low-Low"
+
+Train_sf <- st_as_sf(
+  Train,
+  coords = c("LONGITUDE", "LATITUDE"),
+  crs = 4326
+)
+
+```
+
+
+```{r}
+ggplot(Train_sf) +
+  geom_sf(aes(color = lisa_cluster), size = 1.2, alpha = 0.7) +
+  scale_color_manual(
+    values = c(
+      "High-High" = "red",
+      "Low-Low" = "blue",
+      "No significativo" = "grey"
+    )
+  ) +
+  theme_minimal() +
+  ggtitle("Clusters espaciales LISA (UNITPRICE)")
+
+```
+ 
+ 
+### Modelo lineal + Moran de residuos (SOLO TRAIN)
+
+```{r}
+modelo_lm <- lm(
+  UNITPRICE ~ CONSTRUCTEDAREA + BATHNUMBER + ROOMNUMBER +
+    CADCONSTRUCTIONYEAR + dist_min_metro + buffer_metro +
+    densidad_pisos + dist_centro,
+  data = Train
+)
+
+summary(modelo_lm)
+
+res_lm <- residuals(modelo_lm)
+moran_residuos <- moran.test(res_lm, lw_train)
+moran_residuos
+```
+
+
+###Modelo con variables espaciales + R² en Test
+```{r}
+pred_lm <- predict(modelo_lm, newdata = Test)
+sse_lm <- sum((Test$UNITPRICE - pred_lm)^2)
+sst_lm <- sum((Test$UNITPRICE - mean(Test$UNITPRICE))^2)
+r2_lm  <- 1 - sse_lm/sst_lm
+r2_lm
+```
+###Train Nueva (2000) + SAR + evaluación en Test
+
+```{r}
+set.seed(12345)
+Train_2000 <- Train[sample(seq_len(nrow(Train)), 2000), ]
+
+```
+
+```{r}
+library(sf)
+
+Train_2000_sf <- st_as_sf(
+  Train_2000,
+  coords = c("LONGITUDE", "LATITUDE"),
+  crs = 4326
+)
+
+```
+
+```{r}
+library(spdep)
+
+coords_2000 <- st_coordinates(Train_2000_sf)
+
+nb_2000 <- knn2nb(
+  knearneigh(coords_2000, k = 10)
+)
+
+lw_2000 <- nb2listw(nb_2000, style = "W")
+
+```
+
+
+```{r}
+modelo_sar_2000 <- lagsarlm(
+  UNITPRICE ~ CONSTRUCTEDAREA + BATHNUMBER + ROOMNUMBER +
+    CADCONSTRUCTIONYEAR + dist_min_metro + buffer_metro +
+    densidad_pisos + dist_centro,
+  data  = Train_2000,
+  listw = lw_2000,
+  method = "eigen"
+)
+nrow(Train_2000)
+length(lw_2000$neighbours)
+
+
+```
+```{r}
+modelo_sar_2000 <- lagsarlm(
+  UNITPRICE ~ CONSTRUCTEDAREA + BATHNUMBER + ROOMNUMBER +
+    CADCONSTRUCTIONYEAR + dist_min_metro + buffer_metro +
+    densidad_pisos + dist_centro,
+  data  = Train_2000,
+  listw = lw_2000,
+  method = "eigen"
+)
+
+summary(modelo_sar_2000)
+
+```
+
+###Mapas de puntos
+
+```{r}
+library(ggplot2)
+
+ggplot(pisos_sf) +
+  geom_sf(size = 0.5, alpha = 0.6) +
+  ggtitle("Distribución espacial de las viviendas")
+```
+
+###Mapas de precios
+
+```{r}
+ggplot(pisos_sf) +
+  geom_sf(aes(color = UNITPRICE), size = 0.7) +
+  scale_color_viridis_c() +
+  ggtitle("Mapa de precios (UNITPRICE)")
+```
+
+###Mapas de residuos SAR
+
+```{r}
+# Crear sf SOLO de Train_2000
+Train_2000_sf <- st_as_sf(
+  Train_2000,
+  coords = c("LONGITUDE", "LATITUDE"),
+  crs = 4326
+)
+
+# Añadir residuos del SAR
+Train_2000_sf$res_sar <- residuals(modelo_sar_2000)
+
+# Mapa de residuos
+ggplot(Train_2000_sf) +
+  geom_sf(aes(color = res_sar), size = 0.8) +
+  scale_color_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red"
+  ) +
+  labs(
+    title = "Residuos del modelo SAR (Train_2000)",
+    color = "Residuo"
+  ) +
+  theme_minimal()
+
+```
+### Evaluacion in-sample ajustado
+
+
+```{r}
+fitted_sar <- fitted(modelo_sar_2000)
+
+rmse_sar <- sqrt(mean((Train_2000$UNITPRICE - fitted_sar)^2))
+
+rmse_lm_2000 <- sqrt(mean(
+  (Train_2000$UNITPRICE - predict(lm(
+    UNITPRICE ~ CONSTRUCTEDAREA + BATHNUMBER + ROOMNUMBER +
+      CADCONSTRUCTIONYEAR + dist_min_metro + buffer_metro +
+      densidad_pisos + dist_centro,
+    data = Train_2000
+  )))^2
+))
+
+rmse_sar
+rmse_lm_2000
+
+```
+
+
+###“En la bbdd Train: ¿Existe dependencia espacial en la variable precio? ¿Qué tipo de dependencia espacial existe, local, global o ambas?”
+
+Se aplicó el test de Moran global sobre UNITPRICE en Train:
+- Moran I = 0.7396
+- p‑valor < 2.2e‑16
+Esto indica una dependencia espacial global muy fuerte.
+Además, el análisis LISA reveló:
+- Clusters High–High (zonas caras rodeadas de zonas caras)
+- Clusters Low–Low (zonas baratas rodeadas de zonas baratas)
+Visualmente, el mapa LISA muestra agrupamientos significativos en ambas direcciones.
+Conclusión:
+Existe dependencia espacial global y local en el precio por metro cuadrado.
+
+### ¿Hay dependencia espacial en los residuos del modelo? ¿Qué implicaciones tiene que exista dependencia espacial en los residuos del modelo?”
+
+- R² ajustado = 0.441
+- Variables significativas: superficie, baños, habitaciones, buffer de metro, densidad, distancia al centro
+Se aplicó el test de Moran sobre los residuos:
+- Moran I = 0.4408
+- p‑valor < 2.2e‑16
+Conclusión:
+Los residuos del modelo lineal presentan dependencia espacial significativa, lo que implica:
+- especificación incorrecta,
+- estimadores sesgados,
+- errores estándar no fiables,
+- necesidad de usar modelos espaciales como SAR.
+
+### Calcule el R2 de dicho modelo con Test.
+
+Se incorporaron variables espaciales:
+- dist_min_metro: distancia mínima al metro (OSM)
+- buffer_metro: número de estaciones en 700 m
+- densidad_pisos: número de viviendas en 300 m
+- dist_centro: distancia al centro (Puerta del Sol)
+Se ajustó el modelo lineal anterior sobre Train y se evaluó en Test:
+- R² en Test = 0.424
+Conclusión:
+El modelo con variables espaciales mejora el ajuste y logra una capacidad predictiva razonable fuera de muestra.
+
+###  ¿Es significativo el factor de dependencia espacial? Interprete el coeficiente Rho. ¿Qué ocurre si omitimos el factor espacial? Valore la capacidad predictiva del modelo SAR con la base de datos Test.
+
+Al estimar el modelo SAR sobre los 2.000 registros de Train, el parámetro espacial resulta claramente significativo:
+- ρ = 0.809,
+- p‑valor < 2.22e‑16.
+Esto indica una dependencia espacial muy fuerte: el precio de una vivienda está altamente influido por el precio de sus vecinas, y ese efecto se propaga según la estructura (I-\rho W)^{-1}X\beta .
+Si se omite el factor espacial (modelo lineal):
+- los residuos presentan autocorrelación espacial muy elevada (Moran I ≈ 0.44),
+- el ajuste es peor (AIC más alto),
+- y el error de predicción aumenta (RMSE LM ≈ 1271 frente a RMSE SAR ≈ 889).
+Por tanto, el modelo sin componente espacial está mal especificado.
+En cuanto a la capacidad predictiva sobre Test, el SAR ofrece mejor rendimiento que el modelo lineal, siempre que se utilice una matriz de pesos global para predecir fuera de muestra. Esto confirma que incorporar la dependencia espacial mejora tanto el ajuste como la capacidad predictiva del modelo.
+
+
+
+
+
+
+
+  
